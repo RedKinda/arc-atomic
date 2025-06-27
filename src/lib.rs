@@ -1,17 +1,20 @@
 #![doc = include_str!("../readme.md")]
 
-use std::{fmt, mem, ptr};
+use std::{
+    fmt, mem,
+    ptr::{self, null_mut},
+};
 
 #[cfg(not(loom))]
 use std::sync::{
-    atomic::{AtomicPtr, Ordering},
     Arc,
+    atomic::{AtomicPtr, Ordering},
 };
 
 #[cfg(loom)]
 use loom::sync::{
-    atomic::{AtomicPtr, Ordering},
     Arc,
+    atomic::{AtomicPtr, Ordering},
 };
 
 /// An atomic pointer to an [`Arc`].
@@ -40,27 +43,20 @@ impl<T> AtomicArc<T> {
     /// This will increment a reference count of the current [`Arc`] and return
     /// this to the caller.
     pub fn load(&self) -> Arc<T> {
-        // Ordering: Loads must be ordered globally after all store operations
-        // to allow the ref-cnt of the underlying arc to track references.
-        let raw = self.ptr.load(Ordering::SeqCst);
+        loop {
+            let raw = self.ptr.swap(null_mut(), Ordering::Acquire);
+            if raw.is_null() {
+                // Other thread has exclusive access to the atomic ptr
+                std::thread::yield_now();
+                continue;
+            }
 
-        // Safety: original arc is always created with 'into_raw'.
-        unsafe {
-            // We want an arc but we don't want to actually decrement the ref
-            // count being held by the pointer.
-            let arc = mem::ManuallyDrop::new(Arc::from_raw(raw));
-            // Now clone the original and provide it to the caller.
-            mem::ManuallyDrop::into_inner(arc.clone())
-        }
-    }
-
-    fn swap_ptr(&self, raw: *mut T) -> Arc<T> {
-        // Ordering: Orders all writes (globally) before the final drop of this value.
-        let prev = self.ptr.swap(raw, Ordering::SeqCst);
-        // Safety: Original arc is always created with 'into_raw'.
-        unsafe {
-            // Consumes the original reference count.
-            Arc::from_raw(prev)
+            break unsafe {
+                let arc = mem::ManuallyDrop::new(Arc::from_raw(raw));
+                let r = mem::ManuallyDrop::into_inner(arc.clone());
+                self.ptr.store(raw, Ordering::Release);
+                r
+            };
         }
     }
 
@@ -74,15 +70,36 @@ impl<T> AtomicArc<T> {
     /// The returned [`Arc`] may have additional references still held by other
     /// load calls previously requested.
     pub fn swap(&self, arc: Arc<T>) -> Arc<T> {
-        let raw = Arc::into_raw(arc) as *mut _;
+        let ptr = Arc::into_raw(arc.clone()) as *mut T;
+        loop {
+            let old = self.ptr.load(Ordering::Acquire);
+            if old.is_null() {
+                // Other thread has exclusive access to the atomic ptr
+                std::thread::yield_now();
+                continue;
+            }
 
-        self.swap_ptr(raw)
+            if self
+                .ptr
+                .compare_exchange(old, ptr, Ordering::AcqRel, Ordering::Relaxed)
+                .is_err()
+            {
+                // Other thread has exclusive access to the atomic ptr
+                std::thread::yield_now();
+                continue;
+            }
+
+            break unsafe { Arc::from_raw(old) };
+        }
     }
 }
 
 impl<T> Drop for AtomicArc<T> {
     fn drop(&mut self) {
-        let _ = self.swap_ptr(ptr::null_mut());
+        let ptr = self.ptr.load(Ordering::Acquire);
+        unsafe {
+            ptr.as_mut().map(|ptr| Arc::from_raw(ptr));
+        }
     }
 }
 
@@ -140,6 +157,24 @@ mod tests {
         t1.join().unwrap();
         t2.join().unwrap();
     }
+
+    #[test]
+    fn test_seqfault() {
+        let arc = AtomicArc::new(std::sync::Arc::new(0));
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                for i in 0..1000000 {
+                    let load = arc.load();
+                    assert_eq!(*load, 0);
+                }
+            });
+            scope.spawn(|| {
+                for i in 0..1000000 {
+                    arc.store(Arc::new(0));
+                }
+            });
+        });
+    }
 }
 
 #[cfg(all(test, loom))]
@@ -192,4 +227,23 @@ mod loom_tests {
             arc.swap(Arc::new(2));
         });
     }
+
+    // #[test]
+    // fn other_segfault() {
+    //     loom::model(|| {
+    //         let arc = Arc::new(AtomicArc::new(Arc::new(0)));
+    //         let handle = arc.clone();
+    //         thread::spawn(move || {
+    //             for i in 0..3 {
+    //                 let load = handle.load();
+    //                 assert_eq!(*load, 0);
+    //             }
+    //         });
+    //         thread::spawn(move || {
+    //             for i in 0..3 {
+    //                 arc.store(Arc::new(0));
+    //             }
+    //         });
+    //     });
+    // }
 }
